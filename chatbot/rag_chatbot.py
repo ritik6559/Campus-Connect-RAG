@@ -1,19 +1,26 @@
 import os
+import re
 import logging
 from typing import Optional
 
 from langchain_openai import ChatOpenAI
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_classic.chains import ConversationalRetrievalChain
 from langchain_classic.memory import ConversationBufferWindowMemory
-from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain_core.documents import Document
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-CHAT_MODEL = "gpt-4o-mini"
-TOP_K = 5
-MEMORY_WINDOW = 6  
+CHAT_MODEL   = "gpt-4o-mini"
+TOP_K        = 20         
+MEMORY_WINDOW = 6
+
 
 SYSTEM_TEMPLATE = """You are a helpful faculty information assistant for Jaypee University \
 of Information Technology (JUIT), Waknaghat, Himachal Pradesh.
@@ -22,14 +29,14 @@ You help students, staff, and visitors find accurate information about JUIT facu
 across all departments: Computer Science & IT, Electronics & Communication, Humanities & \
 Social Sciences, Biotechnology & Informatics, and Civil Engineering.
 
-Use ONLY the retrieved context below to answer the question. If the answer is not found \
-in the context, say so clearly and suggest visiting https://www.juit.ac.in
+Use ONLY the retrieved context below to answer the question. Do NOT invent details.
 
 Rules:
-- Be concise, accurate, and professional.
-- Format multiple faculty as a clean list.
-- For contact info always add: "Please verify on the official JUIT website."
-- Never invent or guess faculty details.
+- For listing queries, list EVERY faculty member present in the context — do not truncate.
+- For count queries, count exactly how many faculty appear in the context and state that number.
+- Format multiple faculty as a numbered or bulleted list with name and designation.
+- For contact info add: "Please verify on the official JUIT website: https://www.juit.ac.in"
+- If info is not in the context, say so and direct to https://www.juit.ac.in
 
 Retrieved Context:
 ──────────────────
@@ -48,11 +55,12 @@ CONDENSE_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
         "Given the following conversation history and a follow-up question, "
-        "rephrase the follow-up question to be a standalone question that contains "
-        "all necessary context. Return ONLY the rephrased question.",
+        "rephrase the follow-up question to be a standalone, self-contained question. "
+        "Return ONLY the rephrased question.",
     ),
-    ("human", "Chat history:\n{chat_history}\n\nFollow-up question: {question}"),
+    ("human", "Chat history:\n{chat_history}\n\nFollow-up: {question}"),
 ])
+
 
 DEPT_KEYWORDS: dict[str, list[str]] = {
     "Computer Science & IT": [
@@ -77,17 +85,42 @@ DEPT_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
+AGGREGATE_PATTERNS = [
+    r"\ball\b",
+    r"\blist\b",
+    r"\bhow many\b",
+    r"\bcount\b",
+    r"\btotal\b",
+    r"\beveryone\b",
+    r"\bevery\b",
+    r"\bfull list\b",
+    r"\bcomplete list\b",
+    r"\bshow all\b",
+    r"\bname all\b",
+]
+
 
 def detect_department(query: str) -> Optional[str]:
-    """Return the most likely department name from query keywords, or None."""
+
     q = query.lower()
+
     for dept, keywords in DEPT_KEYWORDS.items():
         if any(kw in q for kw in keywords):
             return dept
     return None
 
 
+def is_aggregate_query(query: str) -> bool:
+    """Return True if the query is asking for a full list or count."""
+
+    q = query.lower()
+
+    return any(re.search(pat, q) for pat in AGGREGATE_PATTERNS)
+
+
+
 class JUITChatbot:
+
     def __init__(
         self,
         vectorstore: Chroma,
@@ -96,7 +129,6 @@ class JUITChatbot:
         top_k: int = TOP_K,
     ):
         api_key = openai_api_key or os.environ["OPENAI_API_KEY"]
-
         self.vectorstore = vectorstore
         self.top_k = top_k
 
@@ -113,34 +145,36 @@ class JUITChatbot:
             return_messages=True,
         )
 
-        self._retriever = vectorstore.as_retriever(
+
+    def _fetch_aggregate(self, department: Optional[str]) -> list[Document]:
+        """
+        Bypass semantic search: fetch ALL faculty docs for a dept (or all depts)
+        directly from ChromaDB using metadata filter.
+        """
+        from vectorstore.vector_store import get_all_faculty_by_department, get_all_faculty
+
+        if department:
+            return get_all_faculty_by_department(self.vectorstore, department)
+        else:
+            return get_all_faculty(self.vectorstore)
+
+    def _fetch_semantic(self, query: str, department: Optional[str]) -> list[Document]:
+        """Standard top-k semantic search, optionally filtered by department."""
+
+        search_kwargs: dict = {"k": self.top_k}
+
+        if department:
+            search_kwargs["filter"] = {"department": department}
+
+        retriever = self.vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": top_k},
+            search_kwargs=search_kwargs,
         )
 
-        self._chain = self._build_chain(self._retriever)
+        return retriever.invoke(query)
+
 
     def _build_chain(self, retriever) -> ConversationalRetrievalChain:
-        return ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
-            retriever=retriever,
-            memory=self.memory,
-            condense_question_prompt=CONDENSE_PROMPT,
-            combine_docs_chain_kwargs={"prompt": QA_PROMPT},
-            return_source_documents=True,
-            verbose=False,
-        )
-
-    def _get_chain_for_query(self, query: str) -> ConversationalRetrievalChain:
-        dept = detect_department(query)
-        if dept:
-            logger.info(f"Department filter applied: {dept}")
-            retriever = self.vectorstore.as_retriever(
-                search_type="similarity",
-                search_kwargs={"k": self.top_k, "filter": {"department": dept}},
-            )
-        else:
-            retriever = self._retriever
 
         return ConversationalRetrievalChain.from_llm(
             llm=self.llm,
@@ -151,40 +185,80 @@ class JUITChatbot:
             return_source_documents=True,
             verbose=False,
         )
+
+
+    def _answer_aggregate(self, query: str, docs: list[Document]) -> str:
+        """
+        For aggregate queries, build context from ALL docs and call LLM directly.
+        We don't use ConversationalRetrievalChain here because we already have
+        all the docs — no retrieval step needed.
+        """
+
+        context = "\n\n".join(d.page_content for d in docs)
+
+        messages = QA_PROMPT.format_messages(context=context, question=query)
+        response = self.llm.invoke(messages)
+
+        return response.content.strip()
+
 
     def chat(self, user_message: str) -> dict:
-       
-        logger.info(f"Query: {user_message}")
-        chain = self._get_chain_for_query(user_message)
-        result = chain.invoke({"question": user_message})
 
-        answer: str = result["answer"]
-        source_docs = result.get("source_documents", [])
+        logger.info(f"Query: {user_message}")
+
+        dept        = detect_department(user_message)
+        aggregate   = is_aggregate_query(user_message)
+
+        logger.info(f"  dept={dept}  aggregate={aggregate}")
+
+        if aggregate:
+            docs   = self._fetch_aggregate(dept)
+            answer = self._answer_aggregate(user_message, docs)
+
+            self.memory.chat_memory.add_user_message(user_message)
+            self.memory.chat_memory.add_ai_message(answer)
+
+            source_docs = docs
+
+        else:
+            retriever = self.vectorstore.as_retriever(
+                search_type="similarity",
+                search_kwargs={
+                    "k": self.top_k,
+                    **({"filter": {"department": dept}} if dept else {}),
+                },
+            )
+            chain  = self._build_chain(retriever)
+            result = chain.invoke({"question": user_message})
+            answer = result["answer"]
+            source_docs = result.get("source_documents", [])
 
         seen: set[str] = set()
         sources: list[dict] = []
+
         for doc in source_docs:
             name = doc.metadata.get("name", "")
             if name and name not in seen:
                 seen.add(name)
                 sources.append({
-                    "name": name,
-                    "department": doc.metadata.get("department", ""),
+                    "name":        name,
+                    "department":  doc.metadata.get("department", ""),
                     "designation": doc.metadata.get("designation", ""),
-                    "email": doc.metadata.get("email", ""),
+                    "email":       doc.metadata.get("email", ""),
                     "profile_url": doc.metadata.get("profile_url", ""),
                 })
 
-        logger.info(f"Answer: {answer[:120]}...")
+        logger.info(f"Answer preview: {answer[:120]}…")
+        
         return {
-            "answer": answer,
+            "answer":           answer,
             "source_documents": source_docs,
-            "sources": sources,
-            "department_filter": detect_department(user_message),
+            "sources":          sources,
+            "department_filter":dept,
+            "query_type":       "aggregate" if aggregate else "semantic",
         }
 
     def reset(self):
-        """Clear conversation memory."""
         self.memory.clear()
         logger.info("Memory cleared.")
 
@@ -192,35 +266,30 @@ class JUITChatbot:
 
 def run_cli(chatbot: JUITChatbot):
     print("\n" + "=" * 60)
-    print("  JUIT Faculty Information Chatbot  (LangChain RAG)")
-    print("  Commands: 'reset' — clear history | 'quit' — exit")
+    print("  JUIT Faculty Chatbot  (LangChain RAG)")
+    print("  'reset' — clear history | 'quit' — exit")
     print("=" * 60 + "\n")
 
     while True:
         try:
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
-            break
+            print("\nGoodbye!"); break
 
         if not user_input:
             continue
         if user_input.lower() in ("quit", "exit"):
-            print("Goodbye!")
-            break
+            print("Goodbye!"); break
         if user_input.lower() == "reset":
             chatbot.reset()
-            print("Conversation memory cleared.\n")
-            continue
+            print("History cleared.\n"); continue
 
         result = chatbot.chat(user_input)
         print(f"\nAssistant: {result['answer']}")
+        print(f"[{result['query_type']} query | {len(result['sources'])} faculty retrieved]")
 
         if result["sources"]:
             print("\n📚 Sources:")
-            for s in result["sources"][:4]:
-                line = f"  • {s['name']} | {s['department']}"
-                if s["designation"]:
-                    line += f" | {s['designation']}"
-                print(line)
+            for s in result["sources"][:5]:
+                print(f"  • {s['name']} | {s['department']} | {s['designation']}")
         print()

@@ -11,3 +11,4 @@ lxml
 sentence-transformers
 jq
 gradio
+langchain_chroma
